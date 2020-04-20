@@ -58,6 +58,7 @@ class Player {
 	private static final int maxResponseTime = 37;
 
 	private static int oppMinen = 0;
+	private static Set<Integer> localizedOppMinen = new HashSet<>();
 
 	public static Set<Integer> myMines = new HashSet<>();
 
@@ -94,8 +95,10 @@ class Player {
 		while (start.isEmpty()) {
 			startX = ((int) (Math.random() * 15));
 			startY = ((int) (Math.random() * 15));
-			boolean firstRandm = new PathFinder(cells, 20).findBestnextSteps(startX, startY);
-			if (cells[startX][startY] == CELL.VIRGIN_WATER && firstRandm) {
+			if (cells[startX][startY] == CELL.VIRGIN_WATER && startX > 2 && startX < 13 && startY > 2 && startY < 13 && Stream.of(
+					new int[] { startX + 1, startY }, new int[] { startX - 1, startY }, new int[] { startX, startY - 1 },
+					new int[] { startX, startY + 1 }).allMatch(coord -> isValidWater(coord[0], coord[1])) && new PathFinder(cells,
+					20).findBestnextSteps(startX, startY)) {
 				start = startX + " " + startY;
 
 			}
@@ -117,7 +120,6 @@ class Player {
 			silenceCooldown = in.nextInt();
 			mineCooldown = in.nextInt();
 			String sonarResult = in.next();
-			sonarSector = null;
 			if (in.hasNextLine()) {
 				in.nextLine();
 			}
@@ -133,6 +135,8 @@ class Player {
 					oppRenseignements.updateSonarNotInSector(sonarSector);
 				}
 			}
+			sonarSector = null;
+
 			boolean oppAutoKillPossibility = opponentOrders.contains("TRIGGER") || opponentOrders.contains("TORPEDO");
 
 			if (torpedoAt != null) {
@@ -147,9 +151,11 @@ class Player {
 				}
 			}
 
-			myLifesReminder = myLife;
 			torpedoAt = null;
-			treatOppOrder(opponentOrders);
+			treatOppOrder(opponentOrders, oppRenseignements.getPossiblePresences());
+			myLifesReminder = myLife;
+			System.err.println("Opponent mines : " + localizedOppMinen.stream().map(String::valueOf).collect(Collectors.joining(",")));
+
 			oppRenseignements.logAbsenceVerified();
 			oppLifesReminder = oppLife;
 
@@ -158,23 +164,40 @@ class Player {
 
 			cells[myX][myY] = CELL.VISITED_WATER;
 /*
-			int[] barycentre = oppRenseignements.isCloseTo(6);
+			int[] barycentre = oppRenseignements.isCloseTo(4);
 			if (barycentre != null) {
-				System.err.println("barycentre : " + barycentre[0] + "-" + barycentre[1]);
-				if (Math.abs(barycentre[0] - myX) + Math.abs(barycentre[1] - myY) > 5) {
-					List<Character> newPath = new PathFinder().findPathToPoint(myX, myY, barycentre[0], barycentre[1]);
-					if (newPath != null) {
-						System.err.println("Setting Path to attack");
-						currentRoadmap = newPath;
+				System.err.println("Point to attack : " + barycentre[0] + "-" + barycentre[1]);
+
+			}
+			if (barycentre != null) {
+				Future<Boolean> futureRoadMap = executor.submit(() -> {
+					if (Math.abs(barycentre[0] - myX) + Math.abs(barycentre[1] - myY) > 4) {
+						PathFinder newPath = new PathFinder(cells, 100);
+						List<Character> pathToAttack = newPath.findPathToPoint(myX, myY, barycentre[0], barycentre[1]);
+						if (pathToAttack != null) {
+							currentRoadmap = pathToAttack;
+						}
 					}
+					return true;
+				});
+				int restTime = Math.min(30, (int) (maxResponseTime - (System.nanoTime() - startTime) / 1000000));
+				System.err.println("Find path to attack (" + restTime + ")");
+
+				try {
+					futureRoadMap.get(restTime, TimeUnit.MILLISECONDS);
 				}
+				catch (InterruptedException | ExecutionException | TimeoutException e) {
+					System.err.println("No time to find path to attack");
+				}
+
 			}*/
 
 			List<Integer> possiblesPresences = oppRenseignements.getPossiblePresences();
 			boolean canSonar = sonarCooldown == 0;
 			boolean canDepositMine = mineCooldown == 0;
 
-			if (currentRoadmap.size() < 15 && !noMoreCells || currentRoadmap.size() == 1) {
+			if (currentRoadmap.size() < 15 && !noMoreCells || currentRoadmap.size() < 2
+					|| !localizedOppMinen.isEmpty() && checkIfIsMineOnPath()) {
 				if (noMoreCells) {
 					actions.add("SURFACE");
 					myRenseignements.updateSonar(sector(myX, myY));
@@ -199,145 +222,119 @@ class Player {
 					pathFinder.log();
 
 				}
-
-				currentRoadmap = pathFinder.findBestnextStepsWithLimitedTime(myX, myY, 35);
-				noMoreCells = currentRoadmap.size() < 15;
+				if (!pathFinder.bestSteps.isEmpty()) {
+					currentRoadmap = pathFinder.bestSteps;
+				}
+				noMoreCells = currentRoadmap.size() < 7;
 				System.err.println("New roadmap with size of: " + currentRoadmap.size());
 			}
-
+			int possiblePresenceSize = possiblesPresences.size();
 			// Attack strategy
-			if (possiblesPresences.size() < 20) {
-				int restTime = Math.min(35, (int) (maxResponseTime - (System.nanoTime() - startTime) / 1000000));
-				System.err.println("Begin attack strategy search (" + restTime + ")");
+			if (possiblePresenceSize < 10) {
+				int restTime = Math.min(37, (int) (maxResponseTime - (System.nanoTime() - startTime) / 1000000));
+				if (restTime > 0) {
+					System.err.println("Begin attack strategy search (" + restTime + ")");
 
-				Future<Boolean> attackStrategyFuture = executor.submit(() -> {
+					Future<Boolean> attackStrategyFuture = executor.submit(() -> {
 
-					Optional<Map.Entry<Integer, Integer>> choosenTargetTorpedo = Optional.empty();
-					Optional<Map.Entry<Integer, Integer>> choosenTargetMine = Optional.empty();
+						DuetInt choosenTargetTorpedo = new DuetInt(0, 0);
+						DuetInt choosenTargetMine = new DuetInt(0, 0);
 
-					if (torpedoCooldown == 0 && possiblesPresences.size() < 10) {
-						System.err.println("Search Torpedo tazrgets");
-						Map<Integer, Integer> possibleTargets = possibleTargets(myX, myY, myX, myY, new HashSet<>(), possiblesPresences,
-								new HashMap<>());
-						if (logEnabled) {
-							System.err.println("Possible targets = " + possibleTargets.entrySet()
-									.stream()
-									.max(Comparator.comparingInt(Map.Entry::getValue))
-									.map(target -> target.getKey() + "(" + target.getValue() + ")"));
+						if (torpedoCooldown == 0 && possiblePresenceSize < 5) {
+							System.err.println("Search Torpedo tazrgets");
+							int[] possibleTargets = possibleTargets(myX, myY, myX, myY, new HashSet<>(), new HashSet<>(),
+									possiblesPresences, new int[15 * 15]);
+							for (int i = 0; i < possibleTargets.length; i++) {
+								if (possibleTargets[i] > 0) {
+									System.err.print(i + ":" + possibleTargets[i] + ",");
+								}
+							}
+
+							int maxIndex = maxAt(possibleTargets);
+							if (logEnabled) {
+								System.err.println("Possible targets = " + maxIndex + "(" + possibleTargets[maxIndex] + ")");
+							}
+							choosenTargetTorpedo = new DuetInt(maxIndex, possibleTargets[maxIndex]);
+							System.err.println("torpedo target found");
+
 						}
-						choosenTargetTorpedo = possibleTargets.entrySet()
-								.stream()
-								.filter(target -> target.getValue() != 0)
-								.max(Comparator.comparingInt(Map.Entry::getValue));
-						System.err.println("torpedo target found");
+						if (!myMines.isEmpty()) {
+							System.err.println("Search Minen tazrgets");
+							int[] possibleTargets = possibleMines(possiblesPresences, new int[15 * 15]);
 
-					}
-					if (!myMines.isEmpty()) {
-						System.err.println("Search Minen tazrgets");
-						Map<Integer, Integer> possibleTargets = possibleMines(possiblesPresences, new HashMap<>());
-						if (logEnabled) {
-							System.err.println("My mines : " + myMines.stream().map(String::valueOf).collect(Collectors.joining(",")));
-							System.err.println("Possible Mines = " + possibleTargets.entrySet()
-									.stream()
-									.max(Comparator.comparingInt(Map.Entry::getValue))
-									.map(target -> target.getKey() + "(" + target.getValue() + ")"));
+							int maxIndex = maxAt(possibleTargets);
+							if (logEnabled) {
+								System.err.println("Possible Mines = " + maxIndex + "(" + possibleTargets[maxIndex] + ")");
+							}
+							choosenTargetMine = new DuetInt(maxIndex, possibleTargets[maxIndex]);
+							System.err.println("Mine target found");
 						}
-						choosenTargetMine = possibleTargets.entrySet()
-								.stream()
-								.filter(target -> target.getValue() != 0)
-								.max(Comparator.comparingInt(Map.Entry::getValue));
-						System.err.println("Mine target found");
-					}
-					System.err.println("Choose mine or torpedo");
-					String commande = null;
-					Optional<Map.Entry<Integer, Integer>> choosenTarget = Optional.empty();
-
-					if (choosenTargetTorpedo.isPresent() && choosenTargetMine.isPresent()) {
-						System.err.println("Both present");
-						if (choosenTargetTorpedo.get().getValue() >= choosenTargetMine.get().getValue()) {
-							System.err.println("Torpedo first");
-
+						System.err.println("Choose mine or torpedo");
+						String commande = null;
+						int choosenTarget = -1;
+						if (choosenTargetTorpedo.getValue() >= choosenTargetMine.getValue() && choosenTargetTorpedo.getValue() > 0
+								&& possiblePresenceSize < 5) {
 							commande = "TORPEDO";
-							choosenTarget = choosenTargetTorpedo;
-						}
-						else {
-							System.err.println("Mine first");
+							choosenTarget = choosenTargetTorpedo.getKey();
+							System.err.println("Attack strategy Torpedo : " + choosenTargetTorpedo);
 
+						}
+						else if (choosenTargetMine.getValue() > 0 && (possiblePresenceSize < 10)) {
 							commande = "TRIGGER";
-							choosenTarget = choosenTargetMine;
+							choosenTarget = choosenTargetMine.getKey();
+							System.err.println("Attack strategy Mine : " + choosenTargetMine);
 						}
-					}
-					else if (choosenTargetTorpedo.isPresent()) {
-						System.err.println("Only torpedo");
-						commande = "TORPEDO";
-						choosenTarget = choosenTargetTorpedo;
-					}
-					else if (choosenTargetMine.isPresent()) {
-						System.err.println("Only mine");
-						commande = "TRIGGER";
-						choosenTarget = choosenTargetMine;
-					}
 
-					if (commande != null) {
-						Integer coors = choosenTarget.get().getKey();
-						int presenceX = coors % 15;
-						int presenceY = Math.floorDiv(coors, 15);
-						if (commande.equals("TRIGGER")) {
-							myMines.remove(coors);
+						if (commande != null) {
+							int presenceX = choosenTarget % 15;
+							int presenceY = Math.floorDiv(choosenTarget, 15);
+							if (commande.equals("TRIGGER")) {
+								myMines.remove(choosenTarget);
+							}
+							else {
+								willUseTorpedo = true;
+								myRenseignements.sendTorpedoAt(presenceX, presenceY);
+							}
+							actions.add(commande + " " + presenceX + " " + presenceY);
+							torpedoAt = presenceX + presenceY * 15;
 						}
 						else {
-							willUseTorpedo = true;
-							myRenseignements.sendTorpedoAt(presenceX, presenceY);
+							System.err.println("Nothing to attack");
 						}
-						System.err.println(commande + " " + presenceX + " " + presenceY);
-						actions.add(commande + " " + presenceX + " " + presenceY);
-						torpedoAt = presenceX + presenceY * 15;
-						System.err.println("Attack strategy Found");
-					}
-					else {
-						System.err.println("Nothing to attack");
-					}
-					return true;
-				});
+						return true;
+					});
 
-				try {
-					attackStrategyFuture.get(restTime, TimeUnit.MILLISECONDS);
+					try {
+						attackStrategyFuture.get(restTime, TimeUnit.MILLISECONDS);
+					}
+					catch (InterruptedException | ExecutionException | TimeoutException e) {
+						System.err.println("Not enough time to compute attack strategy");
+					}
 				}
-				catch (InterruptedException | ExecutionException | TimeoutException e) {
-					System.err.println("Not enough time to compute attack strategy");
+				else {
+					System.err.println("No time to compute attack");
 				}
 
 			}
-
-			if (canSonar) {
-				int restTime = Math.min(10, (int) (maxResponseTime - (System.nanoTime() - startTime) / 1000000));
-
+			int restTime = Math.min(20, (int) (maxResponseTime - (System.nanoTime() - startTime) / 1000000));
+			if (canSonar && restTime > 0) {
+				System.err.println("Begin sector to sonar search (" + restTime + ")");
 				Future<?> sonarFuture = executor.submit(() -> {
-
-					System.err.println("Begin sector to sonar search (" + restTime + ")");
 					sonarSector = oppRenseignements.chooseSectorToScan();
 					if (sonarSector != null) {
 						actions.add("SONAR " + sonarSector);
-						if (sonarSector == sector(myX, myY)) {
-							myRenseignements.updateSonar(sonarSector);
-						}
-						else {
-							myRenseignements.updateSonarNotInSector(sonarSector);
-						}
+						System.err.println("SectorToSonar found : " + sonarSector);
 					}
-					System.err.println("SectorToSonar found");
-
 				});
 
 				try {
-
 					sonarFuture.get(restTime, TimeUnit.MILLISECONDS);
 				}
 				catch (InterruptedException | ExecutionException | TimeoutException e) {
 					System.err.println("Not enough time to compute sonar");
 				}
 			}
-			int restTime = Math.min(10, (int) (maxResponseTime - (System.nanoTime() - startTime) / 1000000));
+			restTime = Math.min(20, (int) (maxResponseTime - (System.nanoTime() - startTime) / 1000000));
 
 			if (canDepositMine && restTime > 0) {
 				System.err.println("Begin direction de deposit search (" + restTime + ")");
@@ -363,7 +360,6 @@ class Player {
 				}));
 
 				try {
-
 					mineFuture.get(restTime, TimeUnit.MILLISECONDS);
 				}
 				catch (InterruptedException | ExecutionException | TimeoutException e) {
@@ -371,11 +367,10 @@ class Player {
 				}
 			}
 			restTime = maxResponseTime - (int) (((System.nanoTime() - startTime) / 1000000));
-			if (silenceCooldown == 0 && myRenseignements.getPossiblePresences().size() < 3
-					&& oppRenseignements.minDistanceOfMe(myX, myY) < 8 && oppMinen < 10 && currentRoadmap.size() > 10 && restTime > 0) {
+			if (silenceCooldown == 0 && myRenseignements.getPossiblePresences().size() < 4 && currentRoadmap.size() > 10 && restTime > 0) {
 				System.err.println("Check silence (" + restTime + ")");
 
-				Future<?> addSilence = executor.submit(() -> {
+				/*Future<?> addSilence = executor.submit(() -> {
 					int i = 0;
 					char direction = currentRoadmap.get(0);
 					while (i < 4 && !currentRoadmap.isEmpty() && currentRoadmap.get(0).equals(direction)) {
@@ -405,7 +400,10 @@ class Player {
 				}
 				catch (InterruptedException | ExecutionException | TimeoutException e) {
 					System.err.println("Not enough time to add silence");
-				}
+				}*/
+
+				actions.add("SILENCE N 0");
+				myRenseignements.updateSilence();
 			}
 
 			String nextCharge = getNextCharge(willUseTorpedo);
@@ -434,20 +432,19 @@ class Player {
 							nextX--;
 							break;
 					}
-					Map<Integer, Integer> possibleTargets = possibleTargets(nextX, nextY, nextX, nextY, new HashSet<>(), possiblesPresences,
-							new HashMap<>());
+					int[] possibleTargets = possibleTargets(nextX, nextY, nextX, nextY, new HashSet<>(), new HashSet<>(),
+							possiblesPresences, new int[15 * 15]);
+
+					int maxIndex = maxAt(possibleTargets);
+					DuetInt choosenTargetTorpedo = new DuetInt(maxIndex, possibleTargets[maxIndex]);
+
 					if (logEnabled) {
-						System.err.println("Possible targets = " + possibleTargets.entrySet()
-								.stream()
-								.max(Comparator.comparingInt(Map.Entry::getValue))
-								.map(target -> target.getKey() + "(" + target.getValue() + ")"));
+						System.err.println("Possible targets = " + choosenTargetTorpedo);
 					}
-					Optional<Map.Entry<Integer, Integer>> choosenTargetTorpedo = possibleTargets.entrySet()
-							.stream()
-							.filter(target -> target.getValue() != 0)
-							.max(Comparator.comparingInt(Map.Entry::getValue));
-					if (choosenTargetTorpedo.isPresent()) {
-						Integer coors = choosenTargetTorpedo.get().getKey();
+					System.err.println("torpedo target found");
+
+					if (choosenTargetTorpedo.value > 0) {
+						int coors = choosenTargetTorpedo.key;
 						int presenceX = coors % 15;
 						int presenceY = Math.floorDiv(coors, 15);
 						actions.add("TORPEDO " + presenceX + " " + presenceY);
@@ -464,6 +461,70 @@ class Player {
 			System.out.println(String.join(" | ", actions));
 			myRenseignements.update(currentRoadmap.get(0));
 			currentRoadmap.remove(0);
+		}
+	}
+
+
+	private static boolean checkIfIsMineOnPath() {
+		int x = myX;
+		int y = myY;
+		int i = 0;
+		while (i < 20 && i < currentRoadmap.size() - 2) {
+			switch (currentRoadmap.get(i)) {
+				case 'N':
+					y--;
+					break;
+				case 'S':
+					y++;
+					break;
+				case 'E':
+					x++;
+					break;
+				case 'W':
+					x--;
+					break;
+			}
+			if (checkIfIsMineisAround(x + y * 15)) {
+				System.err.println("Mine is found at " + i);
+				return true;
+			}
+			i++;
+		}
+		return false;
+	}
+
+
+	private static boolean checkIfIsMineisAround(int position) {
+		return localizedOppMinen.contains(position) || localizedOppMinen.contains(position - 15) || localizedOppMinen.contains(position - 1)
+				|| localizedOppMinen.contains(position + 1) || localizedOppMinen.contains(position + 15);
+	}
+
+
+	private static class DuetInt {
+
+		private int key;
+		private int value;
+
+
+		public DuetInt(int key, int value) {
+			this.key = key;
+			this.value = value;
+		}
+
+
+		public int getKey() {
+			return key;
+		}
+
+
+		public int getValue() {
+			return value;
+		}
+
+
+		@Override
+		public String toString() {
+			return key + " : " + value;
 		}
 	}
 
@@ -512,24 +573,37 @@ class Player {
 	}
 
 
+	private static int maxAt(int[] array) {
+
+		int maxAt = 0;
+
+		for (int i = 0; i < array.length; i++) {
+			maxAt = array[i] > array[maxAt] ? i : maxAt;
+		}
+		return maxAt;
+
+	}
+
+
 	public static int sector(int x, int y) {
 		return Math.floorDiv(x, 5) + 1 + (Math.floorDiv(y, 5) + 1) * 3;
 	}
 
 
-	public static Map<Integer, Integer> possibleTargets(int fromX, int fromY, int x, int y, Set<Integer> cellsCrossed,
-			List<Integer> possiblePresence, Map<Integer, Integer> result) {
+	public static int[] possibleTargets(int fromX, int fromY, int x, int y, Set<Integer> cellsCrossed, Set<Integer> counted,
+			List<Integer> possiblePresence, int[] result) {
 		cellsCrossed.add(x + y * 15);
-		if ((Math.abs(x - fromX) > 1 || Math.abs(y - fromY) > 1)) {
-			result.put(x + y * 15, 0);
+		if (!counted.contains(x + y * 15) && (Math.abs(x - fromX) > 1 || Math.abs(y - fromY) > 1)) {
+			counted.add(x + y * 15);
 			if (possiblePresence.contains(x + y * 15)) {
-				result.put(x + y * 15, result.get(x + y * 15) + 2);
+				result[x + y * 15] += 2;
+				System.err.println("Torpedo : " + x + "-" + y);
 			}
 			Stream.of(new int[] { x + 1, y }, new int[] { x - 1, y }, new int[] { x, y - 1 }, new int[] { x, y + 1 },
 					new int[] { x + 1, y - 1 }, new int[] { x - 1, y - 1 }, new int[] { x - 1, y + 1 }, new int[] { x + 1, y + 1 })
 					.map(coor -> coor[0] + coor[1] * 15)
 					.filter(possiblePresence::contains)
-					.forEach(coord -> result.put(x + y * 15, result.get(x + y * 15) + 1));
+					.forEach(coord -> result[x + y * 15] += 1);
 
 		}
 
@@ -537,7 +611,7 @@ class Player {
 			Stream.of(new int[] { x + 1, y }, new int[] { x - 1, y }, new int[] { x, y - 1 }, new int[] { x, y + 1 })
 					.filter(coord -> !cellsCrossed.contains(coord[0] + coord[1] * 15))
 					.filter(coord -> isValidWater(coord[0], coord[1]))
-					.forEach(coord -> possibleTargets(fromX, fromY, coord[0], coord[1], cellsCrossed, possiblePresence, result));
+					.forEach(coord -> possibleTargets(fromX, fromY, coord[0], coord[1], cellsCrossed, counted, possiblePresence, result));
 		}
 
 		cellsCrossed.remove(x + y * 15);
@@ -545,20 +619,19 @@ class Player {
 	}
 
 
-	public static Map<Integer, Integer> possibleMines(List<Integer> possiblePresence, Map<Integer, Integer> result) {
+	public static int[] possibleMines(List<Integer> possiblePresence, int[] result) {
 		for (int mine : myMines) {
 			int x = mine % 15;
 			int y = Math.floorDiv(mine, 15);
 			if ((Math.abs(x - myX) > 1 || Math.abs(y - myY) > 1)) {
-				result.put(x + y * 15, 0);
 				if (possiblePresence.contains(x + y * 15)) {
-					result.put(x + y * 15, result.get(x + y * 15) + 2);
+					result[x + y * 15] += 2;
 				}
 				Stream.of(new int[] { x + 1, y }, new int[] { x - 1, y }, new int[] { x, y - 1 }, new int[] { x, y + 1 },
 						new int[] { x + 1, y - 1 }, new int[] { x - 1, y - 1 }, new int[] { x - 1, y - 1 }, new int[] { x + 1, y + 1 })
 						.map(coor -> coor[0] + coor[1] * 15)
 						.filter(possiblePresence::contains)
-						.forEach(coord -> result.put(x + y * 15, result.get(x + y * 15) + 1));
+						.forEach(coord -> result[x + y * 15] += 1);
 			}
 		}
 
@@ -566,7 +639,7 @@ class Player {
 	}
 
 
-	public static void treatOppOrder(String order) {
+	public static void treatOppOrder(String order, List<Integer> possiblePresences) {
 		String[] orders = order.split("\\|");
 		for (String s : orders) {
 			if (s.contains("MOVE")) {
@@ -583,19 +656,25 @@ class Player {
 				else if (myLifesReminder - myLife == 2) {
 					myRenseignements.isAt(myX, myY);
 				}
-
 				String[] items = s.split(" ");
 				int torpedoX = Integer.parseInt(items[1]);
 				int torpedoY = Integer.parseInt(items[2]);
 				oppRenseignements.sendTorpedoAt(torpedoX, torpedoY);
-
 			}
 			else if (s.contains("SILENCE")) {
 				oppRenseignements.updateSilence();
 				System.err.println("Silence of opp");
 			}
 			else if (s.contains("SONAR")) {
+				String[] items = s.split(" ");
+				int sector = Integer.parseInt(items[1]);
 				System.err.println("Sonar of opp");
+				if (sector == sector(myX, myY)) {
+					myRenseignements.updateSonar(sector);
+				}
+				else {
+					myRenseignements.updateSonarNotInSector(sector);
+				}
 			}
 			else if (s.contains("SURFACE")) {
 				String[] items = s.split(" ");
@@ -606,6 +685,16 @@ class Player {
 			}
 			else if (s.contains("MINE")) {
 				System.err.println("Mine of opp");
+				if (possiblePresences.size() < 2) {
+					possiblePresences.forEach(presence -> {
+						int x = presence % 15;
+						int y = Math.floorDiv(presence, 15);
+
+						Stream.of(new int[] { x + 1, y }, new int[] { x - 1, y }, new int[] { x, y - 1 }, new int[] { x, y + 1 })
+								.filter(coord -> isValidWater(coord[0], coord[1]))
+								.forEach(coord -> localizedOppMinen.add(coord[0] * 15 + coord[1]));
+					});
+				}
 				oppMinen++;
 			}
 			else if (s.contains("TRIGGER")) {
@@ -643,6 +732,7 @@ class Player {
 		private int yAttackArrival;
 		Set<Character> directions = new HashSet<>(Arrays.asList('N', 'S', 'W', 'E'));
 		private CELL[][] map;
+		private boolean ignoreMines = false;
 
 
 		public PathFinder(CELL[][] map, int limit) {
@@ -660,6 +750,7 @@ class Player {
 
 			Future<Boolean> future = executor.submit(() -> {
 				findBestnextSteps(currentX, currentY);
+
 				return true;
 			});
 
@@ -667,7 +758,6 @@ class Player {
 				future.get(time, TimeUnit.MILLISECONDS);
 			}
 			catch (InterruptedException | ExecutionException | TimeoutException e) {
-
 				System.err.println("Finnished computing steps " + bestSteps.size() + "/" + limit + " numberOfTries = " + numberOfTries + "/"
 						+ numberOfTriesLimit);
 			}
@@ -679,7 +769,13 @@ class Player {
 			if (goNear(currentX, currentY, toX, toY)) {
 				findBestnextSteps(xAttackArrival, yAttackArrival);
 				if (bestSteps.size() > 50) {
-					return Stream.of(itineraireAttack, bestSteps).flatMap(Collection::stream).collect(Collectors.toList());
+					List<Character> pathTpAttack = Stream.of(itineraireAttack, bestSteps)
+							.flatMap(Collection::stream)
+							.collect(Collectors.toList());
+					System.err.println(itineraireAttack.stream().map(String::valueOf).collect(Collectors.joining(",")));
+
+					System.err.println(pathTpAttack.stream().map(String::valueOf).collect(Collectors.joining(",")));
+					return pathTpAttack;
 				}
 			}
 			return null;
@@ -790,17 +886,14 @@ class Player {
 				}
 				itineraireAttack.remove(itineraireAttack.size() - 1);
 			}
-
 			cellsVisited.remove(x + y * 15);
-
 			return false;
-
 		}
 
 
 		private boolean isValidCell(int x, int y) {
 			boolean isOnTheMap = x >= 0 && x < width && y >= 0 && y < height;
-			return isOnTheMap && map[x][y] == CELL.VIRGIN_WATER && !cellsVisited.contains(x + y * 15);
+			return isOnTheMap && map[x][y] == CELL.VIRGIN_WATER && !cellsVisited.contains(x + y * 15) && !checkIfIsMineisAround(x + y * 15);
 		}
 
 	}
@@ -906,7 +999,7 @@ class Player {
 					}
 				}
 			}
-			return (maxX - minX < trigger && maxY - minY < trigger) ?
+			return count > 0 && (maxX - minX < trigger && maxY - minY < trigger) ?
 					new int[] { Math.floorDiv(sumX, count), Math.floorDiv(sumY, count) } :
 					null;
 
@@ -1152,10 +1245,10 @@ class Player {
 
 
 		public void updateSonarNotInSector(int sector) {
-			int minY = (int) (Math.floor((sonarSector - 1) / 3.0) * 5);
-			int maxY = ((int) (Math.floor((sonarSector - 1) / 3.0)) + 1) * 5 - 1;
-			int minX = ((sonarSector - 1) % 3) * 5;
-			int maxX = ((sonarSector - 1) % 3 + 1) * 5 - 1;
+			int minY = (int) (Math.floor((sector - 1) / 3.0) * 5);
+			int maxY = ((int) (Math.floor((sector - 1) / 3.0)) + 1) * 5 - 1;
+			int minX = ((sector - 1) % 3) * 5;
+			int maxX = ((sector - 1) % 3 + 1) * 5 - 1;
 
 			System.err.println(name + " Opp not in sector : " + sector + " " + minX + " " + maxX + " / " + minY + " " + maxY);
 			for (int x = minX; x <= maxX; x++) {
@@ -1271,7 +1364,7 @@ class Player {
 			}
 			System.err.println("Scores " + line + " Scan sector " + (index + 1));
 
-			if (Arrays.stream(scores).filter(s -> s > 9).count() < 4) {
+			if (Arrays.stream(scores).filter(s -> s > 7).count() < 4) {
 				return null;
 			}
 			return index + 1;
